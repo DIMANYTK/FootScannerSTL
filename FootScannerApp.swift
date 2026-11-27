@@ -121,7 +121,7 @@ struct ContentView: View {
         scanner.minDistanceMm = minDistanceMm
         scanner.maxDistanceMm = maxDistanceMm
         if let url = scanner.exportBinarySTL(minZMm: minDistanceMm, maxZMm: maxDistanceMm) {
-            statusMessage = "STL сохранён (\(Int(minDistanceMm))–\(Int(maxDistanceMm)) мм)"
+            statusMessage = "Сохранён: \(url.lastPathComponent)"
             shareURL = url
         } else {
             statusMessage = "Нет точек в диапазоне 5–50 см"
@@ -180,8 +180,8 @@ class DepthScanner: NSObject, ObservableObject, AVCaptureDepthDataOutputDelegate
         guard let base = CVPixelBufferGetBaseAddress(map) else { return }
         let ptr = base.assumingMemoryBound(to: Float32.self)
 
-        let minZ = max(0.05, minDistanceMm / 1000.0) // 5 см
-        let maxZ = max(minZ + 0.05, min(0.50, maxDistanceMm / 1000.0)) // до 50 см
+        let minZ = max(0.05, minDistanceMm / 1000.0)
+        let maxZ = max(minZ + 0.05, min(0.50, maxDistanceMm / 1000.0))
         let span = max(0.01, maxZ - minZ)
 
         var pixels = [UInt8](repeating: 0, count: w * h)
@@ -202,6 +202,28 @@ class DepthScanner: NSObject, ObservableObject, AVCaptureDepthDataOutputDelegate
                 self.previewImage = UIImage(cgImage: cgImg)
             }
         }
+    }
+
+    private func smoothedDepth(ptr: UnsafePointer<Float32>, x: Int, y: Int, w: Int, h: Int, minZ: Float, maxZ: Float) -> Float? {
+        var sum: Float = 0
+        var count: Float = 0
+        for dy in -1...1 {
+            let ny = y + dy
+            if ny < 0 || ny >= h { continue }
+            for dx in -1...1 {
+                let nx = x + dx
+                if nx < 0 || nx >= w { continue }
+                let z = ptr[ny * w + nx]
+                if z.isFinite && z >= minZ && z <= maxZ {
+                    let weight: Float = (dx == 0 && dy == 0) ? 4.0 : ((dx == 0 || dy == 0) ? 2.0 : 1.0)
+                    sum += z * weight
+                    count += weight
+                }
+            }
+        }
+        // Требуем минимум 5 валидных соседей из 9 — отсекает тонкие края и «волосы»
+        guard count >= 7.0 else { return nil }
+        return sum / count
     }
 
     func exportBinarySTL(minZMm: Float, maxZMm: Float) -> URL? {
@@ -229,32 +251,50 @@ class DepthScanner: NSObject, ObservableObject, AVCaptureDepthDataOutputDelegate
 
         let minZ = max(0.05, minZMm / 1000.0)
         let maxZ = max(minZ + 0.05, min(0.50, maxZMm / 1000.0))
-        var pts = [SIMD3<Float>?](repeating: nil, count: w * h)
 
-        for y in 0..<h {
-            for x in 0..<w {
-                let z = ptr[y * w + x]
-                if z.isFinite && z >= minZ && z <= maxZ {
-                    let X = (Float(x) - cx) * z / fx * 1000.0
-                    let Y = (Float(y) - cy) * z / fy * 1000.0
-                    let Z = z * 1000.0
-                    pts[y * w + x] = SIMD3<Float>(X, -Y, -Z)
-                }
+        let step = 2
+        let gw = w / step
+        let gh = h / step
+        var pts = [SIMD3<Float>?](repeating: nil, count: gw * gh)
+
+        for gy in 0..<gh {
+            let y = gy * step
+            for gx in 0..<gw {
+                let x = gx * step
+                guard let z = smoothedDepth(ptr: ptr, x: x, y: y, w: w, h: h, minZ: minZ, maxZ: maxZ) else { continue }
+                let X = (Float(x) - cx) * z / fx * 1000.0
+                let Y = (Float(y) - cy) * z / fy * 1000.0
+                let Z = z * 1000.0
+                pts[gy * gw + gx] = SIMD3<Float>(X, -Y, -Z)
             }
         }
 
         var tris: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = []
-        let maxJump: Float = 15.0
+        let maxJumpMm: Float = 6.0   // жёсткий порог разрыва поверхности
+        let maxEdgeMm: Float = 18.0  // отсекаем длинные «шлейфы» и «иголки»
 
-        for y in 0..<(h - 1) {
-            for x in 0..<(w - 1) {
-                guard let p00 = pts[y * w + x],
-                      let p10 = pts[y * w + x + 1],
-                      let p01 = pts[(y + 1) * w + x],
-                      let p11 = pts[(y + 1) * w + x + 1] else { continue }
+        func isValidTri(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>) -> Bool {
+            if simd_distance(a, b) > maxEdgeMm || simd_distance(b, c) > maxEdgeMm || simd_distance(c, a) > maxEdgeMm {
+                return false
+            }
+            if abs(a.z - b.z) > maxJumpMm || abs(b.z - c.z) > maxJumpMm || abs(c.z - a.z) > maxJumpMm {
+                return false
+            }
+            let crossLen = simd_length(simd_cross(b - a, c - a))
+            return crossLen > 0.05
+        }
 
-                if abs(p00.z - p10.z) < maxJump && abs(p00.z - p01.z) < maxJump && abs(p10.z - p11.z) < maxJump {
+        for gy in 0..<(gh - 1) {
+            for gx in 0..<(gw - 1) {
+                guard let p00 = pts[gy * gw + gx],
+                      let p10 = pts[gy * gw + gx + 1],
+                      let p01 = pts[(gy + 1) * gw + gx],
+                      let p11 = pts[(gy + 1) * gw + gx + 1] else { continue }
+
+                if isValidTri(p00, p01, p10) {
                     tris.append((p00, p01, p10))
+                }
+                if isValidTri(p10, p01, p11) {
                     tris.append((p10, p01, p11))
                 }
             }
@@ -279,7 +319,13 @@ class DepthScanner: NSObject, ObservableObject, AVCaptureDepthDataOutputDelegate
             }
         }
 
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("foot_scan.stl")
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm"
+        let stamp = formatter.string(from: Date())
+        let filename = "foot_scan_\(stamp).stl"
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
         try? data.write(to: url)
         return url
     }
