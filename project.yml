@@ -1,0 +1,17 @@
+name: FootScannerSTL
+options:
+  bundleIdPrefix: com.dimanytk
+targets:
+  FootScannerSTL:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - FootScannerApp.swift
+    info:
+      path: Info.plist
+      properties:
+        UILaunchScreen: {}
+        NSCameraUsageDescription: "Нужен доступ к TrueDepth камере для 3D-сканирования стопы"
+        UIRequiredDeviceCapabilities:
+          - arm64
